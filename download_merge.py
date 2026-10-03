@@ -249,10 +249,19 @@ def download_one(
     return report, dest, None, "downloaded"
 
 
+def _say(message: str, *, error: bool = False, log=None) -> None:
+    """CLI에서는 화면에 찍고, 태블릿 화면에서는 log로 넘긴다."""
+    if log is not None:
+        log(message)
+        return
+    print(message, file=sys.stderr if error else sys.stdout)
+
+
 def download_all(
     reports: list[Report],
     library: DownloadLibrary,
     workers: int,
+    log=None,
 ) -> tuple[list[str], dict[str, Path], int, int]:
     failures: list[str] = []
     paths: dict[str, Path] = {}
@@ -267,18 +276,19 @@ def download_all(
             done += 1
             if error or path is None:
                 failures.append(f"{report.bookmark}: {error}")
-                print(
+                _say(
                     f"[{done}/{total}] #{report.index} 실패 {report.doc_id} {error}",
-                    file=sys.stderr,
+                    error=True,
+                    log=log,
                 )
                 continue
             paths[report.doc_id] = path
             if status == "cached":
                 cached += 1
-                print(f"[{done}/{total}] #{report.index} 이미 받음 {report.bookmark}")
+                _say(f"[{done}/{total}] #{report.index} 이미 받음 {report.bookmark}", log=log)
             else:
                 downloaded += 1
-                print(f"[{done}/{total}] #{report.index} {report.bookmark}")
+                _say(f"[{done}/{total}] #{report.index} {report.bookmark}", log=log)
     return failures, paths, downloaded, cached
 
 
@@ -286,6 +296,7 @@ def merge_pdfs(
     reports: list[Report],
     paths: dict[str, Path],
     output: Path,
+    log=None,
 ) -> tuple[int, int]:
     writer = PdfWriter()
     merged = 0
@@ -309,7 +320,7 @@ def merge_pdfs(
             merged += 1
         except (PdfReadError, Exception) as exc:
             skipped += 1
-            print(f"병합 제외 {path.name}: {exc}", file=sys.stderr)
+            _say(f"병합 제외 {path.name}: {exc}", error=True, log=log)
     if merged == 0:
         raise RuntimeError("합칠 PDF가 없습니다.")
     output.parent.mkdir(parents=True, exist_ok=True)
@@ -405,12 +416,14 @@ def run_one(
     target_count: int,
     download_dir: Path,
     workers: int,
+    log=None,
 ) -> int:
     label = f"{category_id} {category_name}".strip() or "주제전체"
-    print(
+    _say(
         f"목록 수집: {label} cmsCode={cms_code} "
         f"categoryId={category_id or '(전체)'} "
-        f"구간={start_index}-{end_index} ({end_index - start_index + 1}개)"
+        f"구간={start_index}-{end_index} ({end_index - start_index + 1}개)",
+        log=log,
     )
     reports, ended_early, last_position = collect_reports(
         cms_code=cms_code,
@@ -422,17 +435,19 @@ def run_one(
     )
     if not reports:
         if ended_early:
-            print(
+            _say(
                 f"{label}: 목록은 {last_position}건입니다. {start_index}번째부터는 없습니다.",
-                file=sys.stderr,
+                error=True,
+                log=log,
             )
         else:
-            print(f"{label}: 다운로드 가능한 문서를 찾지 못했습니다.", file=sys.stderr)
+            _say(f"{label}: 다운로드 가능한 문서를 찾지 못했습니다.", error=True, log=log)
         return 1
     if ended_early and reports[-1].index < end_index:
-        print(
+        _say(
             f"{label}: 목록은 {last_position}건입니다. "
-            f"{reports[0].index}-{reports[-1].index}만 받습니다."
+            f"{reports[0].index}-{reports[-1].index}만 받습니다.",
+            log=log,
         )
     output = output_path_for(
         output_spec,
@@ -442,20 +457,22 @@ def run_one(
         reports[0].index,
         reports[-1].index,
     )
-    print(
+    _say(
         f"{len(reports)}건 선택 ({reports[0].index}-{reports[-1].index}번째). "
-        f"다운로드 시작 (동시 {workers}) -> {download_dir}"
+        f"다운로드 시작 (동시 {workers}) -> {download_dir}",
+        log=log,
     )
     library = DownloadLibrary(download_dir)
-    failures, paths, downloaded, cached = download_all(reports, library, workers)
-    merged, pages = merge_pdfs(reports, paths, output)
+    failures, paths, downloaded, cached = download_all(reports, library, workers, log=log)
+    merged, pages = merge_pdfs(reports, paths, output, log=log)
     size_mb = output.stat().st_size / (1024 * 1024)
-    print(
+    _say(
         f"완료: {label} {merged}개 문서, {pages}페이지, {size_mb:.1f}MB -> {output} "
-        f"(새로 받음 {downloaded}, 이미 있던 파일 {cached})"
+        f"(새로 받음 {downloaded}, 이미 있던 파일 {cached})",
+        log=log,
     )
     if failures:
-        print(f"{label}: 실패한 다운로드 {len(failures)}건", file=sys.stderr)
+        _say(f"{label}: 실패한 다운로드 {len(failures)}건", error=True, log=log)
         return 1
     return 0
 
