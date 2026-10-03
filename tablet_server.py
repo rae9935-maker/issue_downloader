@@ -42,7 +42,7 @@ PAGE = """<!DOCTYPE html>
     --accent: #0c6b4d;
     --accent-press: #084e38;
     --warn: #8a4b08;
-    --bar: #d7efe4;
+    --bar: #e7e1d4;
   }
   * { box-sizing: border-box; }
   body {
