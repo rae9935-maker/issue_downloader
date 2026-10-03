@@ -409,7 +409,8 @@ def run_one(
     label = f"{category_id} {category_name}".strip() or "주제전체"
     print(
         f"목록 수집: {label} cmsCode={cms_code} "
-        f"categoryId={category_id or '(전체)'} 구간={start_index}-{end_index}"
+        f"categoryId={category_id or '(전체)'} "
+        f"구간={start_index}-{end_index} ({end_index - start_index + 1}개)"
     )
     reports, ended_early, last_position = collect_reports(
         cms_code=cms_code,
@@ -488,24 +489,35 @@ def build_parser() -> argparse.ArgumentParser:
         help="주제 코드와 이름을 출력하고 끝냅니다.",
     )
     parser.add_argument(
+        "--start",
+        type=int,
+        default=None,
+        help="시작 파일 번호. 목록 맨 앞이 1입니다. --end와 함께 쓰면 개수는 자동으로 계산됩니다.",
+    )
+    parser.add_argument(
+        "--end",
+        type=int,
+        default=None,
+        help="끝 파일 번호(포함). --start 10 --end 59 는 50개입니다.",
+    )
+    parser.add_argument(
         "--range",
         type=parse_range,
-        help="목록 순번 구간. 10-59는 10번째부터 59번째까지 50개입니다. "
-        "이미 받은 문서는 다시 받지 않으므로, 다음에는 60-109처럼 이어 가면 됩니다. "
-        "이 옵션이 있으면 --limit은 쓰지 않습니다.",
+        help="--start와 --end를 한 번에 적는 형식. 10-59는 10번째부터 59번째까지 50개입니다.",
     )
     parser.add_argument(
         "--limit",
         type=int,
-        default=100,
-        help="앞에서부터 받을 문서 수 (기본값 100). --range가 있으면 무시됩니다.",
+        default=None,
+        help="시작·끝 번호 없이 앞에서부터 받을 개수. 생략하면 100개입니다. "
+        "시작과 끝을 주면 이 값은 쓰지 않습니다.",
     )
     parser.add_argument(
         "--start-page",
         type=int,
         default=1,
         help="--limit과 함께 쓸 시작 페이지. 순번은 목록 맨 앞을 1로 센다. "
-        "--range와 함께 쓸 수 없습니다.",
+        "시작·끝 번호와 함께 쓸 수 없습니다.",
     )
     parser.add_argument("--keyword", default="", help="제목 검색어")
     parser.add_argument(
@@ -532,17 +544,61 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def explicit_window(
+    start: int | None,
+    end: int | None,
+    range_pair: tuple[int, int] | None,
+) -> tuple[int, int] | None:
+    """시작·끝 번호가 있으면 (시작, 끝)을 돌려준다. 없으면 None.
+
+    개수는 끝-시작+1이며, --limit으로 자르지 않는다.
+    """
+    if range_pair is not None:
+        range_start, range_end = range_pair
+        if start is not None and start != range_start:
+            raise ValueError("--start와 --range의 시작 번호가 다릅니다.")
+        if end is not None and end != range_end:
+            raise ValueError("--end와 --range의 끝 번호가 다릅니다.")
+        start = range_start if start is None else start
+        end = range_end if end is None else end
+    if start is None and end is None:
+        return None
+    if start is not None and end is None:
+        raise ValueError("끝 파일 번호(--end)도 지정하세요. 개수는 끝-시작+1로 계산합니다.")
+    if start is None:
+        start = 1
+    if end is None:
+        raise ValueError("끝 파일 번호(--end)도 지정하세요.")
+    if start < 1:
+        raise ValueError("시작 파일 번호는 1 이상이어야 합니다.")
+    if end < start:
+        raise ValueError("끝 파일 번호는 시작 번호보다 작을 수 없습니다.")
+    return start, end
+
+
 def main() -> int:
     args = build_parser().parse_args()
-    if args.range is None and args.limit < 1:
+    try:
+        fixed_window = explicit_window(args.start, args.end, args.range)
+    except ValueError as exc:
+        print(exc, file=sys.stderr)
+        return 2
+    if fixed_window is None and args.limit is not None and args.limit < 1:
         print("--limit 은 1 이상이어야 합니다.", file=sys.stderr)
         return 2
-    if args.range is not None and args.start_page != 1:
-        print("--range와 --start-page는 함께 쓸 수 없습니다. 순번 구간만 지정하세요.", file=sys.stderr)
+    if fixed_window is not None and args.start_page != 1:
+        print("시작·끝 번호와 --start-page는 함께 쓸 수 없습니다.", file=sys.stderr)
         return 2
     if args.start_page < 1:
         print("--start-page 는 1 이상이어야 합니다.", file=sys.stderr)
         return 2
+    if fixed_window is not None and args.limit is not None:
+        start_index, end_index = fixed_window
+        count = end_index - start_index + 1
+        print(
+            f"{start_index}번째부터 {end_index}번째까지 {count}개입니다. "
+            f"--limit {args.limit}은 쓰지 않습니다."
+        )
 
     needs_catalog = bool(args.category_id) or args.split_by_category or args.list_categories
     catalog: list[tuple[str, str]] = fetch_categories(args.cms_code) if needs_catalog else []
@@ -569,7 +625,6 @@ def main() -> int:
     else:
         targets = [("", "")]
 
-    fixed_window = args.range
     exit_code = 0
     for category_id, name in targets:
         if fixed_window is not None:
@@ -582,8 +637,9 @@ def main() -> int:
                 category_id,
                 args.start_page,
             )
+            limit = 100 if args.limit is None else args.limit
             start_index = offset + 1
-            end_index = offset + args.limit
+            end_index = offset + limit
         code = run_one(
             cms_code=args.cms_code,
             keyword=args.keyword,
