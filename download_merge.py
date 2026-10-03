@@ -8,8 +8,10 @@ from __future__ import annotations
 
 import argparse
 import html
+import json
 import re
 import sys
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -101,45 +103,74 @@ def parse_list_page(page_html: str) -> list[tuple[str, str, str, str]]:
     return found
 
 
-def collect_reports(
+def fetch_list_rows(
     cms_code: str,
-    limit: int,
-    start_page: int,
+    page: int,
     keyword: str,
     search_type: str,
-    category_id: str = "",
-) -> list[Report]:
+    category_id: str,
+) -> list[tuple[str, str, str, str]]:
+    query = urllib.parse.urlencode(
+        {
+            "page": page,
+            "cmsCode": cms_code,
+            "categoryId": category_id,
+            "searchType": search_type,
+            "searchKeyword": keyword,
+        }
+    )
+    body = fetch(f"{LIST_URL}?{query}").decode("utf-8", errors="replace")
+    return parse_list_page(body)
+
+
+def collect_reports(
+    cms_code: str,
+    keyword: str,
+    search_type: str,
+    category_id: str,
+    start_index: int,
+    end_index: int,
+) -> tuple[list[Report], bool, int]:
+    """목록 1번째부터 세어 start_index~end_index(포함)만 돌려준다.
+
+    두 번째 값은 요청한 끝 번호보다 목록이 짧아서 일찍 끝났는지, 세 번째는 확인한 마지막 순번이다.
+    """
     reports: list[Report] = []
-    page = start_page
-    while len(reports) < limit:
-        query = urllib.parse.urlencode(
-            {
-                "page": page,
-                "cmsCode": cms_code,
-                "categoryId": category_id,
-                "searchType": search_type,
-                "searchKeyword": keyword,
-            }
-        )
-        body = fetch(f"{LIST_URL}?{query}").decode("utf-8", errors="replace")
-        rows = parse_list_page(body)
+    position = 0
+    page = 1
+    while position < end_index:
+        rows = fetch_list_rows(cms_code, page, keyword, search_type, category_id)
         if not rows:
-            break
+            return reports, True, position
         for seq, title, doc_id, filename in rows:
-            reports.append(
-                Report(
-                    index=len(reports) + 1,
-                    seq=seq,
-                    title=title,
-                    doc_id=doc_id,
-                    filename=filename,
+            position += 1
+            if start_index <= position <= end_index:
+                reports.append(
+                    Report(
+                        index=position,
+                        seq=seq,
+                        title=title,
+                        doc_id=doc_id,
+                        filename=filename,
+                    )
                 )
-            )
-            if len(reports) >= limit:
-                break
+            if position >= end_index:
+                return reports, False, position
         page += 1
         time.sleep(0.15)
-    return reports
+    return reports, False, position
+
+
+def parse_range(text: str) -> tuple[int, int]:
+    match = re.fullmatch(r"(\d+)\s*-\s*(\d+)", text.strip())
+    if not match:
+        raise argparse.ArgumentTypeError("범위는 10-59 형식입니다. 시작과 끝은 목록 순번입니다.")
+    start, end = int(match.group(1)), int(match.group(2))
+    if start < 1:
+        raise argparse.ArgumentTypeError("범위 시작은 1 이상이어야 합니다.")
+    if end < start:
+        raise argparse.ArgumentTypeError("범위 끝은 시작보다 작을 수 없습니다.")
+    return start, end
 
 
 def safe_filename(name: str) -> str:
@@ -151,12 +182,55 @@ def report_path(download_dir: Path, report: Report) -> Path:
     return download_dir / f"{report.index:04d}_{report.doc_id}_{safe_filename(report.filename)}"
 
 
-def download_one(report: Report, dest: Path) -> tuple[Report, str | None]:
-    if dest.exists() and dest.stat().st_size > 500:
-        with dest.open("rb") as handle:
-            head = handle.read(5)
-        if head == b"%PDF-":
-            return report, None
+def is_valid_pdf(path: Path) -> bool:
+    if not path.is_file() or path.stat().st_size <= 500:
+        return False
+    with path.open("rb") as handle:
+        return handle.read(5) == b"%PDF-"
+
+
+class DownloadLibrary:
+    """doc_id 기준으로 이미 받은 파일을 기록한다. 같은 문서는 다시 받지 않는다."""
+
+    def __init__(self, directory: Path):
+        self.directory = directory
+        self.directory.mkdir(parents=True, exist_ok=True)
+        self.manifest_path = directory / "manifest.json"
+        self._lock = threading.Lock()
+        self.entries: dict[str, str] = {}
+        if self.manifest_path.exists():
+            loaded = json.loads(self.manifest_path.read_text(encoding="utf-8"))
+            if isinstance(loaded, dict):
+                self.entries = {str(key): str(value) for key, value in loaded.items()}
+
+    def find(self, report: Report) -> Path | None:
+        with self._lock:
+            recorded = self.entries.get(report.doc_id)
+        if recorded:
+            candidate = self.directory / recorded
+            if is_valid_pdf(candidate):
+                return candidate
+        canonical = report_path(self.directory, report)
+        if is_valid_pdf(canonical):
+            self.remember(report.doc_id, canonical)
+            return canonical
+        return None
+
+    def remember(self, doc_id: str, path: Path) -> None:
+        with self._lock:
+            self.entries[doc_id] = path.name
+            payload = json.dumps(self.entries, ensure_ascii=False, indent=2) + "\n"
+            self.manifest_path.write_text(payload, encoding="utf-8")
+
+
+def download_one(
+    report: Report,
+    library: DownloadLibrary,
+) -> tuple[Report, Path | None, str | None, str]:
+    existing = library.find(report)
+    if existing is not None:
+        return report, existing, None, "cached"
+    dest = report_path(library.directory, report)
     params = urllib.parse.urlencode(
         {
             "doc_id": report.doc_id,
@@ -167,40 +241,58 @@ def download_one(report: Report, dest: Path) -> tuple[Report, str | None]:
     try:
         data = fetch(f"{DOWNLOAD_URL}?{params}")
     except RuntimeError as exc:
-        return report, str(exc)
+        return report, None, str(exc), "failed"
     if not data.startswith(b"%PDF-"):
-        return report, f"PDF가 아닌 응답 ({len(data)} bytes)"
+        return report, None, f"PDF가 아닌 응답 ({len(data)} bytes)", "failed"
     dest.write_bytes(data)
-    return report, None
+    library.remember(report.doc_id, dest)
+    return report, dest, None, "downloaded"
 
 
-def download_all(reports: list[Report], download_dir: Path, workers: int) -> list[str]:
-    download_dir.mkdir(parents=True, exist_ok=True)
+def download_all(
+    reports: list[Report],
+    library: DownloadLibrary,
+    workers: int,
+) -> tuple[list[str], dict[str, Path], int, int]:
     failures: list[str] = []
+    paths: dict[str, Path] = {}
+    downloaded = 0
+    cached = 0
     with ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
-        futures = [
-            pool.submit(download_one, report, report_path(download_dir, report))
-            for report in reports
-        ]
+        futures = [pool.submit(download_one, report, library) for report in reports]
         done = 0
+        total = len(reports)
         for future in as_completed(futures):
-            report, error = future.result()
+            report, path, error, status = future.result()
             done += 1
-            if error:
+            if error or path is None:
                 failures.append(f"{report.bookmark}: {error}")
-                print(f"[{done}/{len(reports)}] 실패 {report.doc_id} {error}", file=sys.stderr)
+                print(
+                    f"[{done}/{total}] #{report.index} 실패 {report.doc_id} {error}",
+                    file=sys.stderr,
+                )
+                continue
+            paths[report.doc_id] = path
+            if status == "cached":
+                cached += 1
+                print(f"[{done}/{total}] #{report.index} 이미 받음 {report.bookmark}")
             else:
-                print(f"[{done}/{len(reports)}] {report.bookmark}")
-    return failures
+                downloaded += 1
+                print(f"[{done}/{total}] #{report.index} {report.bookmark}")
+    return failures, paths, downloaded, cached
 
 
-def merge_pdfs(reports: list[Report], download_dir: Path, output: Path) -> tuple[int, int]:
+def merge_pdfs(
+    reports: list[Report],
+    paths: dict[str, Path],
+    output: Path,
+) -> tuple[int, int]:
     writer = PdfWriter()
     merged = 0
     skipped = 0
     for report in reports:
-        path = report_path(download_dir, report)
-        if not path.exists():
+        path = paths.get(report.doc_id)
+        if path is None or not path.exists():
             skipped += 1
             continue
         try:
@@ -261,10 +353,12 @@ def output_path_for(
     category_id: str,
     name: str,
     count: int,
+    start_index: int,
+    end_index: int,
 ) -> Path:
-    filename = (
-        f"{category_id}_{safe_filename(name)}.pdf" if category_id else "nars_merged.pdf"
-    )
+    span = f"{start_index:04d}-{end_index:04d}"
+    stem = f"{category_id}_{safe_filename(name)}" if category_id else "nars_merged"
+    filename = f"{stem}_{span}.pdf"
     if spec is None:
         return Path("output") / filename
     if count == 1:
@@ -279,40 +373,86 @@ def download_dir_for(base: Path, category_id: str) -> Path:
     return base / category_id
 
 
+def items_before_page(
+    cms_code: str,
+    keyword: str,
+    search_type: str,
+    category_id: str,
+    start_page: int,
+) -> int:
+    if start_page <= 1:
+        return 0
+    position = 0
+    for page in range(1, start_page):
+        rows = fetch_list_rows(cms_code, page, keyword, search_type, category_id)
+        if not rows:
+            break
+        position += len(rows)
+        time.sleep(0.15)
+    return position
+
+
 def run_one(
     *,
     cms_code: str,
-    limit: int,
-    start_page: int,
     keyword: str,
     search_type: str,
     category_id: str,
     category_name: str,
-    output: Path,
+    start_index: int,
+    end_index: int,
+    output_spec: Path | None,
+    target_count: int,
     download_dir: Path,
     workers: int,
 ) -> int:
     label = f"{category_id} {category_name}".strip() or "주제전체"
     print(
         f"목록 수집: {label} cmsCode={cms_code} "
-        f"categoryId={category_id or '(전체)'} limit={limit} page={start_page}"
+        f"categoryId={category_id or '(전체)'} 구간={start_index}-{end_index}"
     )
-    reports = collect_reports(
+    reports, ended_early, last_position = collect_reports(
         cms_code=cms_code,
-        limit=limit,
-        start_page=start_page,
         keyword=keyword,
         search_type=search_type,
         category_id=category_id,
+        start_index=start_index,
+        end_index=end_index,
     )
     if not reports:
-        print(f"{label}: 다운로드 가능한 문서를 찾지 못했습니다.", file=sys.stderr)
+        if ended_early:
+            print(
+                f"{label}: 목록은 {last_position}건입니다. {start_index}번째부터는 없습니다.",
+                file=sys.stderr,
+            )
+        else:
+            print(f"{label}: 다운로드 가능한 문서를 찾지 못했습니다.", file=sys.stderr)
         return 1
-    print(f"{len(reports)}건 수집. 다운로드 시작 (동시 {workers}) -> {download_dir}")
-    failures = download_all(reports, download_dir, workers)
-    merged, pages = merge_pdfs(reports, download_dir, output)
+    if ended_early and reports[-1].index < end_index:
+        print(
+            f"{label}: 목록은 {last_position}건입니다. "
+            f"{reports[0].index}-{reports[-1].index}만 받습니다."
+        )
+    output = output_path_for(
+        output_spec,
+        category_id,
+        category_name,
+        target_count,
+        reports[0].index,
+        reports[-1].index,
+    )
+    print(
+        f"{len(reports)}건 선택 ({reports[0].index}-{reports[-1].index}번째). "
+        f"다운로드 시작 (동시 {workers}) -> {download_dir}"
+    )
+    library = DownloadLibrary(download_dir)
+    failures, paths, downloaded, cached = download_all(reports, library, workers)
+    merged, pages = merge_pdfs(reports, paths, output)
     size_mb = output.stat().st_size / (1024 * 1024)
-    print(f"완료: {label} {merged}개 문서, {pages}페이지, {size_mb:.1f}MB -> {output}")
+    print(
+        f"완료: {label} {merged}개 문서, {pages}페이지, {size_mb:.1f}MB -> {output} "
+        f"(새로 받음 {downloaded}, 이미 있던 파일 {cached})"
+    )
     if failures:
         print(f"{label}: 실패한 다운로드 {len(failures)}건", file=sys.stderr)
         return 1
@@ -348,12 +488,25 @@ def build_parser() -> argparse.ArgumentParser:
         help="주제 코드와 이름을 출력하고 끝냅니다.",
     )
     parser.add_argument(
+        "--range",
+        type=parse_range,
+        help="목록 순번 구간. 10-59는 10번째부터 59번째까지 50개입니다. "
+        "이미 받은 문서는 다시 받지 않으므로, 다음에는 60-109처럼 이어 가면 됩니다. "
+        "이 옵션이 있으면 --limit은 쓰지 않습니다.",
+    )
+    parser.add_argument(
         "--limit",
         type=int,
         default=100,
-        help="주제마다 받을 문서 수 (기본값 100)",
+        help="앞에서부터 받을 문서 수 (기본값 100). --range가 있으면 무시됩니다.",
     )
-    parser.add_argument("--start-page", type=int, default=1, help="목록 시작 페이지")
+    parser.add_argument(
+        "--start-page",
+        type=int,
+        default=1,
+        help="--limit과 함께 쓸 시작 페이지. 순번은 목록 맨 앞을 1로 센다. "
+        "--range와 함께 쓸 수 없습니다.",
+    )
     parser.add_argument("--keyword", default="", help="제목 검색어")
     parser.add_argument(
         "--search-type",
@@ -366,15 +519,14 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         default=None,
         help="합친 PDF 경로. 주제가 하나일 때만 이 파일을 그대로 씁니다. "
-        "여러 주제면 이 경로의 폴더에 '{categoryId}_{이름}.pdf'로 저장합니다. "
-        "생략하면 output/ 아래에 저장합니다.",
+        "여러 주제거나 생략하면 output/{categoryId}_{이름}_{시작}-{끝}.pdf 로 저장합니다.",
     )
     parser.add_argument(
         "--download-dir",
         type=Path,
         default=Path("downloads"),
         help="개별 PDF를 저장할 폴더. 주제별로 하위 폴더를 나눕니다. "
-        "이미 있으면 다시 받지 않습니다.",
+        "manifest.json에 받은 doc_id를 적어 두어, 다음 실행에서는 같은 문서를 다시 받지 않습니다.",
     )
     parser.add_argument("--workers", type=int, default=4, help="동시 다운로드 수")
     return parser
@@ -382,8 +534,14 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main() -> int:
     args = build_parser().parse_args()
-    if args.limit < 1:
+    if args.range is None and args.limit < 1:
         print("--limit 은 1 이상이어야 합니다.", file=sys.stderr)
+        return 2
+    if args.range is not None and args.start_page != 1:
+        print("--range와 --start-page는 함께 쓸 수 없습니다. 순번 구간만 지정하세요.", file=sys.stderr)
+        return 2
+    if args.start_page < 1:
+        print("--start-page 는 1 이상이어야 합니다.", file=sys.stderr)
         return 2
 
     needs_catalog = bool(args.category_id) or args.split_by_category or args.list_categories
@@ -411,17 +569,31 @@ def main() -> int:
     else:
         targets = [("", "")]
 
+    fixed_window = args.range
     exit_code = 0
     for category_id, name in targets:
+        if fixed_window is not None:
+            start_index, end_index = fixed_window
+        else:
+            offset = items_before_page(
+                args.cms_code,
+                args.keyword,
+                args.search_type,
+                category_id,
+                args.start_page,
+            )
+            start_index = offset + 1
+            end_index = offset + args.limit
         code = run_one(
             cms_code=args.cms_code,
-            limit=args.limit,
-            start_page=args.start_page,
             keyword=args.keyword,
             search_type=args.search_type,
             category_id=category_id,
             category_name=name,
-            output=output_path_for(args.output, category_id, name, len(targets)),
+            start_index=start_index,
+            end_index=end_index,
+            output_spec=args.output,
+            target_count=len(targets),
             download_dir=download_dir_for(args.download_dir, category_id),
             workers=args.workers,
         )
